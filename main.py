@@ -1,83 +1,112 @@
-import sqlite3
-from flask import Flask, abort, request, url_for, render_template, jsonify, g , session, redirect
-import os
-from flask_googlemaps import GoogleMaps, Map
+import cv2
+import numpy as np
+import requests
+import socket
+import struct
+import threading
+import time
 import json
-from contextlib import closing
 
-# Server Configuration
-DEBUG = True
-DATABASE = "congestion_data.db"
-SECRET_KEY = 'development key'
-USERNAME = "admin"
-PASSWORD = "18349275"
+# ----------Global Variable -------------
+temp_array=np.zeros((1,76800), dtype=np.float32)
 
+class NeuralNetwork:
+    def __init__(self, size, file_location):
+        self.model = cv2.ANN_MLP()
+        self.model.create(np.int32(size))
+        self.model.load(file_location)
+    def predict(self, samples):
+        ret, resp = self.model.predict(samples)
+        return resp.argmax(-1)
 
-app = Flask(__name__)
-app.config.from_object(__name__)
-port = int(os.getenv('VCAP_APP_PORT', '8080'))
+class VideoHandling(threading.Thread):
+    def __init__(self, tcp_addr, BUFFER_SIZE = 1024):
+        threading.Thread.__init__(self)
+        self.total_frames = 0
+        self.BUFFER_SIZE = BUFFER_SIZE
+        self.__state = True
 
-GoogleMaps(app)
+        self.server_socket = socket.socket()
+        self.server_socket.bind(tcp_addr)
+        self.server_socket.listen(0)
 
-def connect_db():
-    return sqlite3.connect(app.config['DATABASE'])
+        self.connection = self.server_socket.accept()[0].makefile('rb')
 
-def init_db():
-    with closing(connect_db()) as db:
-        with app.open_resource('schema.sql', mode='r') as f:
-            db.cursor().executescript(f.read())
-            db.execute('insert into entries (lat, lng, degree) values (?, ? ,?)', [0, 0 ,0])
-        db.commit()
+    def run(self):
+        cv2.startWindowThread()
+        cv2.namedWindow('Traffic', cv2.CV_WINDOW_AUTOSIZE)
 
+        stream_byte = ''
 
-@app.before_request
-def before_request():
-    g.db = connect_db()
+        while self.__state:
+            stream_byte+= self.connection.read(self.BUFFER_SIZE)
+            first = stream_byte.find('\xff\xd8')
+            last = stream_byte.find('\xff\xd9')
+            if first != 1 and last != 1:
+                jpg = stream_byte[first:last+2]
+                stream_byte=stream_byte[last+2:]
+                image = cv2.imdecode(np.fromstring(jpg, dtype=np.uint8), cv2.CV_LOAD_IMAGE_GRAYSCALE)
+                cv2.imshow('Traffic', image)
+                global temp_array
+                temp_array = image.reshape(1, 76800).astype(np.float32)
+                self.total_frames+=1
 
-@app.teardown_request
-def teardown_request(exception):
-    db = getattr(g, "db", None)
-    if db is not None:
-        db.close()
+        cv2.destroyAllWindows()
 
-@app.route('/')
-def view_map():
-    cur = g.db.execute('select lat, lng, degree, moment from entries order by id desc')
-    history = [dict(lat=row[0], lng=row[1], degree=row[2], moment=row[3]) for row in cur.fetchall()]
-    congestion_map = Map(
-        identifier = "place1",
-        lat=10.7500,
-        lng=106.6667,
-        markers=[(10.4500, 106.6600)],
-        infobox=["Do ket xe={degree} %, thoi diem={moment}".format(**history[0])],
-        style="height:1000px;width=1000px;margin:0;"
-    )
-    return render_template("show_map.html", congestion_map=congestion_map, history=history)
+    def stop_handling(self):
+        self.__state = False
 
-@app.route('/login', methods=['POST'])
-def admin_login():
-    input_admin=request.get_json(force=True)
-    if input_admin["username"] == app.config["USERNAME"] and input_admin["password"] == app.config["PASSWORD"]:
-        session["logged_in"] = True
-        return jsonify({"res": "Admin has susscessfully logged in"})
-    else:
-        return jsonify({"res": "Incorrect username or password"})
+class RequestServerBluemix(threading.Thread):
+    def __init__(self, url):
+        threading.Thread.__init__(self)
+        self.headers = {"Content-type": "application/json"}
+        self.login={"username":"admin", "password":"18349275" }
+        self.url = url
+    def send_data(self, data):
+        data = data.update(self.login)
+        res = requests.post(self.url, json.dumps(data), headers=self.headers )
+        return res.text
 
-@app.route('/data_stream', methods=['POST'])
-def data_in():
-    input_admin=request.get_json(force=True)
-    if input_admin["username"] == app.config["USERNAME"] and input_admin["password"] == app.config["PASSWORD"]:
-        data = request.get_json(force=True)
-        g.db.execute('insert into entries (lat, lng, degree) values (?, ? ,?)', [data["lat"], data["lng"], data["degree"]])
-        g.db.commit()
-        return jsonify({"res": "Succesfully insert entry to database"})
-    else:
-        return jsonify({"res": "You have no permission to access database"})
+def send_request(url, data):
+    headers = {"Content-type": "application/json" , 'Accept': 'text/plain'}
+    login={"username":"admin", "password":"18349275" }
+    data.update(login)
+    res = requests.post(url, json.dumps(data), headers=headers )
+    return res.text
 
-@app.route('/logout')
-def admin_logout():
-    session.pop("logged_in", None)
-    return jsonify({"res": "Admin logged out"})
+class FileHandling(threading.Thread):
+    def __init__(self,size, file_location):
+        threading.Thread.__init__(self)
+        self.cap = cv2.VideoCapture(file_location)
+        self.cap.set(3, size[0])
+        self.cap.set(4, size[1])
+        self.__state = True
+    def run(self):
+        cv2.namedWindow("Traffic", cv2.CV_WINDOW_AUTOSIZE)
+        state =True
+        global temp_array
+        try:
+            while self.cap.isOpened() and self.__state:
+                ret, frame = self.cap.read()
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                temp_array = gray.reshape(1, 76800).astype(np.float32)
+                cv2.imshow("Traffic", frame)
+                if cv2.waitKey(20) & 0xFF == ord('q'):
+                    self.__state = False
+        finally:
+            self.cap.release()
+            cv2.destroyAllWindows()
+    def stop_handling(self):
+        self.__state = False
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=port)
+    classifier = NeuralNetwork([76800, 64, 5], 'traffic_classifier.xml')
+    #traffic_data = VideoHandling(('0.0.0.0', 6000))
+    traffic_data = FileHandling((320,240), 'test.avi')
+    traffic_data.setDaemon(True)
+    traffic_data.start()
+    while True:
+        prediction = classifier.predict(temp_array)
+	    #print prediction[0]
+        print send_request('http://congestionmapping.mybluemix.net/data_stream', {"lat": 10.7500, "lng": 106.6667, "degree": prediction[0] + 1}
+        time.sleep(5)
