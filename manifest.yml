@@ -1,0 +1,4 @@
+---
+application:
+- name: congestionmapping
+  memory: 512M
